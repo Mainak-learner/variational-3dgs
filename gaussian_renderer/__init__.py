@@ -92,18 +92,23 @@ def render(viewpoint_camera, pc, pipe, bg_color : torch.Tensor, scaling_modifier
         rotations = rotations,
         cov3D_precomp = cov3D_precomp)
 
+    visibility_filter = radii > 0
+    pixel_gaussian_counter = torch.ones_like(rendered_image[0:1, :, :]) * visibility_filter.sum()
+
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     return {"render": rendered_image,
             "viewspace_points": screenspace_points,
-            "visibility_filter" : radii > 0,
+            "visibility_filter" : visibility_filter,
             "radii": radii,
-            "depth" : depth_image, 
+            "depth" : depth_image,
+            "pixel_gaussian_counter": pixel_gaussian_counter 
         }
 
 def forward_k_times(viewpoint_camera, pc, pipe, bg_color, scaling_modifier = 1.0, override_color = None, k=10): 
     rgbs = []
     depths = []
+    pixel_gaussian_counters = []
 
     for model_id in range(pc.n_models): 
         pc.model_id = model_id
@@ -112,9 +117,13 @@ def forward_k_times(viewpoint_camera, pc, pipe, bg_color, scaling_modifier = 1.0
         depth = out['depth']
         depths.append(depth)
         rgbs.append(rgb)
+        pixel_gaussian_counters.append(out['pixel_gaussian_counter'])
 
     rgbs = torch.stack(rgbs, dim=0)
     depths = torch.stack(depths, dim=0)
+    pixel_gaussian_counters = torch.stack(pixel_gaussian_counters, dim=0)
+    pixel_gaussian_counter_mean = pixel_gaussian_counters.mean(dim=0)
+
     depth_mean = depths.mean(dim=0)
     depth_var = depths.var(dim=0)
 
@@ -129,5 +138,6 @@ def forward_k_times(viewpoint_camera, pc, pipe, bg_color, scaling_modifier = 1.0
             'comp_std': std, 
             'depths': depths, 
             'depth_var': depth_var, 
-            'depth_mean': depth_mean, 
+            'depth_mean': depth_mean,
+            'pixel_gaussian_counter': pixel_gaussian_counter_mean 
         }
