@@ -24,6 +24,7 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 import csv
 from lpipsPyTorch import lpips
+from einops import reduce, repeat
 
 if False: 
     from torch.utils.tensorboard import SummaryWriter
@@ -239,10 +240,27 @@ def render_set(dataset, scene, pipeline):
     render_path = f"{scene.model_path}/test/ours_7000/renders"
     gts_path = f"{scene.model_path}/test/ours_7000/gt"
     unc_path = f"{scene.model_path}/test/ours_7000/unc"
+    fisher_unc_path = f"{scene.model_path}/test/ours_7000/fisher_unc"
 
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
     makedirs(unc_path, exist_ok=True)
+    makedirs(fisher_unc_path, exist_ok=True)
+
+    # FisherRF uncertainty setup
+    params = [
+        gaussians._xyz,
+        gaussians._features_dc,
+        gaussians._features_rest,
+        gaussians._scaling,
+        gaussians._rotation,
+        gaussians._opacity
+    ]
+    name2idx = {"xyz": 0, "rgb": 1, "sh": 2, "scale": 3, "rotation": 4, "opacity": 5}
+    filter_out_idx = [name2idx[k] for k in ["rotation"]]  # Match FisherRF’s default
+    params = [p.requires_grad_(True) for i, p in enumerate(params) if i not in filter_out_idx]
+    optim = torch.optim.SGD(params, 0.)
+    gaussians.optimizer = optim
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
 
@@ -252,6 +270,7 @@ def render_set(dataset, scene, pipeline):
         rgbs = out['comp_rgbs'].detach()
         std = out['comp_std'].detach()
         depths = out['depths'].detach()
+        pixel_gaussian_counter = out['pixel_gaussian_counter'].detach()
 
         mae = ((mean - gt)).abs()
 
@@ -264,6 +283,23 @@ def render_set(dataset, scene, pipeline):
 
         ause_mae_all += ause_mae.item()
         mean_nll_all += mean_nll.item()
+
+        # Compute FisherRF uncertainty
+
+        render_pkg = render(view, gaussians, pipeline, background)
+        pred_img = render_pkg["render"]
+        pred_img.backward(gradient=torch.ones_like(pred_img))
+        H_per_gaussian = sum(reduce(p.grad.detach(), "n ... -> n", "sum") for p in params)
+        hessian_color = repeat(H_per_gaussian.detach(), "n -> n c", c=3)
+        to_homo = lambda x: torch.cat([x, torch.ones(x.shape[:-1] + (1,), dtype=x.dtype, device=x.device)], dim=-1)
+        pts3d_homo = to_homo(gaussians._xyz)
+        pts3d_cam = pts3d_homo @ view.world_view_transform
+        gaussian_depths = pts3d_cam[:, 2, None]
+        hessian_color = hessian_color * gaussian_depths.clamp(min=0)
+        render_pkg_unc = render(view, gaussians, pipeline, background, override_color=hessian_color)
+        fisher_uncertainty = reduce(render_pkg_unc["render"], "c h w -> h w", "mean")
+        fisher_uncertainty_map = torch.log(fisher_uncertainty / pixel_gaussian_counter).clamp(min=0)
+        optim.zero_grad(set_to_none=True)
 
         if eval_depth: 
             depths = depths * scene.depth_scale
@@ -281,6 +317,7 @@ def render_set(dataset, scene, pipeline):
         torchvision.utils.save_image(mean, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(unc_vis_multiply*std, os.path.join(unc_path, '{0:05d}'.format(idx) + ".png"))
+        torchvision.utils.save_image(fisher_uncertainty_map, os.path.join(fisher_unc_path, f'{idx:05d}.png'))
 
 
     psnr_all /= len(views)
