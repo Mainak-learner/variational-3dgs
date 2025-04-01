@@ -113,6 +113,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         iter_end.record()
 
+        if iteration == opt.iterations:
+            for param in gaussians.parameters():
+                param.requires_grad_(True)
+
         with torch.no_grad():
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
@@ -263,7 +267,6 @@ def render_set(dataset, scene, pipeline):
     gaussians.optimizer = optim
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-
         gt = view.original_image[0:3, :, :]
         out = forward_k_times(view, gaussians, pipeline, background)
         mean = out['comp_rgb'].detach()
@@ -272,22 +275,9 @@ def render_set(dataset, scene, pipeline):
         depths = out['depths'].detach()
         pixel_gaussian_counter = out['pixel_gaussian_counter'].detach()
 
-        mae = ((mean - gt)).abs()
-
-        ause_mae, ause_err_mae, ause_err_by_var_mae = ause_br(std.reshape(-1), mae.reshape(-1), err_type='mae')
-        mean_nll = nll_kernel_density(rgbs.permute(1,2,3,0), std, gt)
-
-        psnr_all += psnr(mean, gt).mean().item()
-        ssim_all += ssim(mean, gt).mean().item()
-        lpips_all += lpips(mean, gt, net_type="vgg").mean().item()
-
-        ause_mae_all += ause_mae.item()
-        mean_nll_all += mean_nll.item()
-
-        # Compute FisherRF uncertainty
-
+        # FisherRF uncertainty
         render_pkg = render(view, gaussians, pipeline, background)
-        pred_img = render_pkg["render"]
+        pred_img = render_pkg["render"]  # Should have grad_fn
         pred_img.backward(gradient=torch.ones_like(pred_img))
         H_per_gaussian = sum(reduce(p.grad.detach(), "n ... -> n", "sum") for p in params)
         hessian_color = repeat(H_per_gaussian.detach(), "n -> n c", c=3)
@@ -298,7 +288,7 @@ def render_set(dataset, scene, pipeline):
         hessian_color = hessian_color * gaussian_depths.clamp(min=0)
         render_pkg_unc = render(view, gaussians, pipeline, background, override_color=hessian_color)
         fisher_uncertainty = reduce(render_pkg_unc["render"], "c h w -> h w", "mean")
-        fisher_uncertainty_map = torch.log(fisher_uncertainty / pixel_gaussian_counter).clamp(min=0)
+        fisher_uncertainty_map = torch.log(fisher_uncertainty / pixel_gaussian_counter).clamp(min=0).detach()
         optim.zero_grad(set_to_none=True)
 
         if eval_depth: 
@@ -373,3 +363,16 @@ if __name__ == "__main__":
 
     # All done
     print("\nTraining complete.")
+
+    print("\nTesting gradient propagation:")
+    gaussians = GaussianModel(lp.extract(args).sh_degree)
+    scene = Scene(lp.extract(args), gaussians)
+    test_view = scene.getTestCameras()[0]
+    params = [gaussians._xyz, gaussians._features_dc, gaussians._features_rest, gaussians._scaling, gaussians._opacity]
+    for p in params:
+        p.requires_grad_(True)
+    render_pkg = render(test_view, gaussians, pp.extract(args), background)
+    pred_img = render_pkg["render"]
+    print(f"Test pred_img requires_grad: {pred_img.requires_grad}, grad_fn: {pred_img.grad_fn}")
+    pred_img.backward(gradient=torch.ones_like(pred_img))
+    print("Gradient test passed.")

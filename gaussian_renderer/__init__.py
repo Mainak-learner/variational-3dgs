@@ -95,6 +95,31 @@ def render(viewpoint_camera, pc, pipe, bg_color : torch.Tensor, scaling_modifier
     visibility_filter = radii > 0
     pixel_gaussian_counter = torch.ones_like(rendered_image[0:1, :, :]) * visibility_filter.sum()
 
+    # Debug inputs
+    print(f"means3D requires_grad: {means3D.requires_grad}")
+    print(f"opacity requires_grad: {opacity.requires_grad}")
+    if scales is not None:
+        print(f"scales requires_grad: {scales.requires_grad}")
+    if rotations is not None:
+        print(f"rotations requires_grad: {rotations.requires_grad}")
+    if shs is not None:
+        print(f"shs requires_grad: {shs.requires_grad}")
+    if colors_precomp is not None:
+        print(f"colors_precomp requires_grad: {colors_precomp.requires_grad}")
+
+    rendered_image, radii, depth_image = rasterizer(
+        means3D=means3D,
+        means2D=means2D,
+        shs=shs,
+        colors_precomp=colors_precomp,
+        opacities=opacity,
+        scales=scales,
+        rotations=rotations,
+        cov3D_precomp=cov3D_precomp
+    )
+
+    print(f"rendered_image requires_grad: {rendered_image.requires_grad}, grad_fn: {rendered_image.grad_fn}")
+
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     return {"render": rendered_image,
